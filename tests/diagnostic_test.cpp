@@ -2,10 +2,18 @@
 #include "autosense/protocol.hpp"
 #include "autosense/types.hpp"
 
-#include <cassert>
 #include <cmath>
 #include <iostream>
 #include <string>
+
+#define CHECK(cond)                                                          \
+    do {                                                                     \
+        if (!(cond)) {                                                       \
+            std::cerr << "CHECK failed: " #cond << " at " << __FILE__        \
+                      << ':' << __LINE__ << '\n';                            \
+            return 1;                                                        \
+        }                                                                    \
+    } while (0)
 
 using autosense::Diagnostic;
 using autosense::SensorData;
@@ -29,52 +37,52 @@ int main() {
     {
         Diagnostic diagnostic;
         const auto result = diagnostic.evaluate(normal_sample());
-        assert(result.severity == Severity::Normal);
-        assert(result.issues.empty());
+        CHECK(result.severity == Severity::Normal);
+        CHECK(result.issues.empty());
     }
     {
         Diagnostic diagnostic;
         auto data = normal_sample();
         data.temperature_c = 50.0;
         const auto result = diagnostic.evaluate(data);
-        assert(result.severity == Severity::Warning);
+        CHECK(result.severity == Severity::Warning);
     }
     {
         Diagnostic diagnostic;
         auto data = normal_sample();
         data.temperature_c = 65.0;
         const auto result = diagnostic.evaluate(data);
-        assert(result.severity == Severity::Critical);
+        CHECK(result.severity == Severity::Critical);
     }
     {
         Diagnostic diagnostic;
         auto data = normal_sample();
         data.soc_percent = 101;
         const auto result = diagnostic.evaluate(data);
-        assert(result.severity == Severity::Critical);
+        CHECK(result.severity == Severity::Critical);
     }
     {
         Diagnostic diagnostic;
         (void)diagnostic.evaluate(normal_sample(1));
         const auto result = diagnostic.evaluate(normal_sample(3));
-        assert(result.severity == Severity::Warning);
-        assert(!result.issues.empty());
-        assert(result.issues.front().find("Possible missing samples") != std::string::npos);
+        CHECK(result.severity == Severity::Warning);
+        CHECK(!result.issues.empty());
+        CHECK(result.issues.front().find("Possible missing samples") != std::string::npos);
     }
     {
         auto data = normal_sample(42);
         const auto serialized = autosense::serialize_sample(data);
         const auto parsed = autosense::parse_sample(serialized);
-        assert(parsed.has_value());
-        assert(parsed->sequence == data.sequence);
-        assert(std::abs(parsed->voltage_v - data.voltage_v) < 0.001);
-        assert(parsed->soc_percent == data.soc_percent);
+        CHECK(parsed.has_value());
+        CHECK(parsed->sequence == data.sequence);
+        CHECK(std::abs(parsed->voltage_v - data.voltage_v) < 0.001);
+        CHECK(parsed->soc_percent == data.soc_percent);
     }
     {
         const auto parsed = autosense::parse_sample("1,2,3,4");
-        assert(!parsed.has_value());
+        CHECK(!parsed.has_value());
         const auto negative_sequence = autosense::parse_sample("-1,2,3,4,5,6,7,8,9");
-        assert(!negative_sequence.has_value());
+        CHECK(!negative_sequence.has_value());
     }
 
     std::cout << "All AutoSenseGuard tests passed.\n";
