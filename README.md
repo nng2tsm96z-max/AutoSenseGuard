@@ -142,3 +142,6 @@ sequence,timestamp_ms,speed_kmh,voltage_v,temperature_c,soc,accel_x,accel_y,acce
 - 使用 CMake 构建工程，并通过自动化测试验证主要协议与诊断规则。
 
 请根据你实际完成和验证的内容修改上述简历描述，不要填写没有测量过的性能数字。
+## 9. Roadmap
+
+后续计划见 [ROADMAP.md](ROADMAP.md)。
