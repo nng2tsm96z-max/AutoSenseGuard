@@ -4,8 +4,10 @@
 #include "autosense/protocol.hpp"
 #include "autosense/types.hpp"
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
@@ -17,6 +19,7 @@
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 namespace {
 volatile std::sig_atomic_t stop_requested = 0;
@@ -35,6 +38,20 @@ bool parse_port(const char* text, int& port) {
     } catch (...) {
         return false;
     }
+}
+
+struct QueuedSample {
+    autosense::SensorData data;
+    std::chrono::steady_clock::time_point enqueued_at;
+};
+
+long long percentile_us(const std::vector<long long>& sorted, double p) {
+    if (sorted.empty()) {
+        return 0;
+    }
+    const std::size_t index =
+        static_cast<std::size_t>(p * static_cast<double>(sorted.size() - 1));
+    return sorted[index];
 }
 
 }  // namespace
@@ -84,16 +101,27 @@ int main(int argc, char* argv[]) {
 
     try {
         autosense::CsvLogger logger("logs/sensor_data.csv");
-        autosense::BoundedQueue<autosense::SensorData> queue(1024);
+        autosense::BoundedQueue<QueuedSample> queue(1024);
+        std::uint64_t received_lines = 0;
+        std::uint64_t parsed_count = 0;
+        std::uint64_t rejected_count = 0;
+        std::uint64_t dropped_count = 0;
         std::uint64_t processed_count = 0;
         std::uint64_t warning_count = 0;
         std::uint64_t critical_count = 0;
+        std::vector<long long> queue_wait_us;
 
         std::thread processor([&]() {
             autosense::Diagnostic diagnostic;
-            autosense::SensorData data;
-            while (queue.pop(data)) {
+            QueuedSample item;
+            while (queue.pop(item)) {
                 try {
+                    const auto now = std::chrono::steady_clock::now();
+                    const auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        now - item.enqueued_at).count();
+                    queue_wait_us.push_back(wait_us);
+
+                    const auto& data = item.data;
                     const auto result = diagnostic.evaluate(data);
                     logger.write(data, result);
                     ++processed_count;
@@ -171,13 +199,20 @@ int main(int argc, char* argv[]) {
                     if (!line.empty() && line.back() == '\r') line.pop_back();
                     if (line.empty()) continue;
 
+                    ++received_lines;
                     std::string error;
                     auto sample = autosense::parse_sample(line, &error);
                     if (!sample.has_value()) {
+                        ++rejected_count;
                         std::cerr << "[PROTOCOL REJECTED] " << error << " | line=" << line << '\n';
                         continue;
                     }
-                    if (!queue.push(*sample)) {
+                    ++parsed_count;
+                    const auto push_result = queue.try_push(
+                        QueuedSample{*sample, std::chrono::steady_clock::now()});
+                    if (push_result == autosense::PushResult::DroppedOldest) {
+                        ++dropped_count;
+                    } else if (push_result == autosense::PushResult::Closed) {
                         std::cerr << "Processing queue is closed; dropping sample.\n";
                     }
                 }
@@ -188,9 +223,18 @@ int main(int argc, char* argv[]) {
         queue.close();
         if (processor.joinable()) processor.join();
         ::close(server_fd);
-        std::cout << "Server stopped. Processed=" << processed_count
-                  << ", warning samples=" << warning_count
-                  << ", critical samples=" << critical_count << '\n';
+        std::sort(queue_wait_us.begin(), queue_wait_us.end());
+        std::cout << "Server stopped."
+                  << " lines=" << received_lines
+                  << ", parsed=" << parsed_count
+                  << ", rejected=" << rejected_count
+                  << ", dropped=" << dropped_count
+                  << ", processed=" << processed_count
+                  << ", warning=" << warning_count
+                  << ", critical=" << critical_count
+                  << ", queue_wait_p50=" << percentile_us(queue_wait_us, 0.50) << "us"
+                  << ", queue_wait_p99=" << percentile_us(queue_wait_us, 0.99) << "us"
+                  << '\n';
     } catch (const std::exception& ex) {
         ::close(server_fd);
         std::cerr << "Startup/runtime error: " << ex.what() << '\n';
