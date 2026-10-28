@@ -8,6 +8,12 @@
 
 namespace autosense {
 
+enum class PushResult {
+    Ok,
+    DroppedOldest,
+    Closed
+};
+
 // A bounded, thread-safe queue for passing samples between the receiver and processor.
 template <typename T>
 class BoundedQueue {
@@ -17,6 +23,7 @@ public:
     BoundedQueue(const BoundedQueue&) = delete;
     BoundedQueue& operator=(const BoundedQueue&) = delete;
 
+    // Blocking push: waits until there is room.
     bool push(T value) {
         std::unique_lock<std::mutex> lock(mutex_);
         not_full_.wait(lock, [this] { return closed_ || queue_.size() < capacity_; });
@@ -26,6 +33,23 @@ public:
         queue_.push(std::move(value));
         not_empty_.notify_one();
         return true;
+    }
+
+    // Non-blocking push: if the queue is full, drop the oldest sample.
+    PushResult try_push(T value) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (closed_) {
+            return PushResult::Closed;
+        }
+
+        bool dropped = false;
+        if (queue_.size() >= capacity_) {
+            queue_.pop();
+            dropped = true;
+        }
+        queue_.push(std::move(value));
+        not_empty_.notify_one();
+        return dropped ? PushResult::DroppedOldest : PushResult::Ok;
     }
 
     bool pop(T& value) {
