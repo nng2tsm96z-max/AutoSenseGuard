@@ -9,19 +9,23 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 namespace {
+
 volatile std::sig_atomic_t stop_requested = 0;
 
 void handle_signal(int) {
@@ -43,6 +47,7 @@ bool parse_port(const char* text, int& port) {
 struct QueuedSample {
     autosense::SensorData data;
     std::chrono::steady_clock::time_point enqueued_at;
+    int client_id{0};
 };
 
 long long percentile_us(const std::vector<long long>& sorted, double p) {
@@ -53,6 +58,13 @@ long long percentile_us(const std::vector<long long>& sorted, double p) {
         static_cast<std::size_t>(p * static_cast<double>(sorted.size() - 1));
     return sorted[index];
 }
+
+struct Client {
+    int fd{-1};
+    int id{0};
+    std::string peer;
+    std::string pending;
+};
 
 }  // namespace
 
@@ -66,14 +78,14 @@ int main(int argc, char* argv[]) {
     struct sigaction action{};
     action.sa_handler = handle_signal;
     sigemptyset(&action.sa_mask);
-    action.sa_flags = 0;  // Let accept()/recv() return EINTR so shutdown can proceed.
+    action.sa_flags = 0;  // Let poll()/accept()/recv() return EINTR on Ctrl+C.
     if (::sigaction(SIGINT, &action, nullptr) != 0 ||
         ::sigaction(SIGTERM, &action, nullptr) != 0) {
         std::cerr << "Could not install signal handlers.\n";
         return 1;
     }
 
-    int server_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    const int server_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         std::cerr << "socket() failed: " << std::strerror(errno) << '\n';
         return 1;
@@ -85,7 +97,7 @@ int main(int argc, char* argv[]) {
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(static_cast<std::uint16_t>(port));
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);  // Bind to this Mac/Linux machine only.
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     if (::bind(server_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
         std::cerr << "bind() failed: " << std::strerror(errno)
@@ -93,7 +105,7 @@ int main(int argc, char* argv[]) {
         ::close(server_fd);
         return 1;
     }
-    if (::listen(server_fd, 4) < 0) {
+    if (::listen(server_fd, 16) < 0) {
         std::cerr << "listen() failed: " << std::strerror(errno) << '\n';
         ::close(server_fd);
         return 1;
@@ -112,7 +124,7 @@ int main(int argc, char* argv[]) {
         std::vector<long long> queue_wait_us;
 
         std::thread processor([&]() {
-            autosense::Diagnostic diagnostic;
+            std::unordered_map<int, autosense::Diagnostic> diagnostics;
             QueuedSample item;
             while (queue.pop(item)) {
                 try {
@@ -122,6 +134,7 @@ int main(int argc, char* argv[]) {
                     queue_wait_us.push_back(wait_us);
 
                     const auto& data = item.data;
+                    auto& diagnostic = diagnostics[item.client_id];
                     const auto result = diagnostic.evaluate(data);
                     logger.write(data, result);
                     ++processed_count;
@@ -149,80 +162,140 @@ int main(int argc, char* argv[]) {
 
         std::cout << "AutoSense Guard server listening on 127.0.0.1:" << port << '\n'
                   << "CSV log: logs/sensor_data.csv\n"
-                  << "Start sensor_simulator in another Terminal. Press Ctrl+C to stop.\n";
+                  << "Multiple clients can connect. Press Ctrl+C to stop.\n";
+
+        std::vector<Client> clients;
+        int next_client_id = 1;
 
         while (!stop_requested) {
-            sockaddr_in client_address{};
-            socklen_t client_length = sizeof(client_address);
-            const int client_fd = ::accept(server_fd,
-                                           reinterpret_cast<sockaddr*>(&client_address),
-                                           &client_length);
-            if (client_fd < 0) {
-                if (errno == EINTR && stop_requested) break;
-                if (errno == EINTR) continue;
-                if (stop_requested) break;
-                std::cerr << "accept() failed: " << std::strerror(errno) << '\n';
-                continue;
+            std::vector<pollfd> pfds;
+            pfds.reserve(clients.size() + 1);
+            pfds.push_back(pollfd{server_fd, POLLIN, 0});
+            for (const auto& client : clients) {
+                pfds.push_back(pollfd{client.fd, POLLIN, 0});
             }
 
-            char client_ip[INET_ADDRSTRLEN]{};
-            (void)::inet_ntop(AF_INET, &client_address.sin_addr, client_ip, sizeof(client_ip));
-            std::cout << "Client connected: " << client_ip << ':'
-                      << ntohs(client_address.sin_port) << '\n';
-
-            std::string pending;
-            char buffer[2048];
-            while (!stop_requested) {
-                const ssize_t received = ::recv(client_fd, buffer, sizeof(buffer), 0);
-                if (received == 0) {
-                    std::cout << "Client disconnected.\n";
-                    break;
+            const std::size_t client_count = clients.size();
+            const int ready = ::poll(pfds.data(), pfds.size(), -1);
+            if (ready < 0) {
+                if (errno == EINTR) {
+                    if (stop_requested) break;
+                    continue;
                 }
-                if (received < 0) {
-                    if (errno == EINTR && stop_requested) break;
-                    if (errno == EINTR) continue;
-                    std::cerr << "recv() failed: " << std::strerror(errno) << '\n';
-                    break;
+                std::cerr << "poll() failed: " << std::strerror(errno) << '\n';
+                break;
+            }
+
+            // Accept at most one new client per poll wakeup. The next poll
+            // iteration will pick up additional pending connections.
+            if ((pfds[0].revents & POLLIN) != 0) {
+                sockaddr_in client_address{};
+                socklen_t client_length = sizeof(client_address);
+                const int client_fd = ::accept(
+                    server_fd, reinterpret_cast<sockaddr*>(&client_address), &client_length);
+                if (client_fd < 0) {
+                    if (errno != EINTR) {
+                        std::cerr << "accept() failed: " << std::strerror(errno) << '\n';
+                    }
+                } else {
+                    char client_ip[INET_ADDRSTRLEN]{};
+                    (void)::inet_ntop(
+                        AF_INET, &client_address.sin_addr, client_ip, sizeof(client_ip));
+                    Client client;
+                    client.fd = client_fd;
+                    client.id = next_client_id++;
+                    client.peer = std::string(client_ip) + ":" +
+                                  std::to_string(ntohs(client_address.sin_port));
+                    clients.push_back(std::move(client));
+                    std::cout << "Client connected: id=" << clients.back().id
+                              << " fd=" << client_fd << " "
+                              << clients.back().peer << '\n';
+                }
+            }
+
+            // Iterate backwards so erasing a client does not invalidate the
+            // pfds[i + 1] mapping for clients we have not handled yet.
+            for (std::size_t i = client_count; i-- > 0;) {
+                const short revents = pfds[i + 1].revents;
+                if (revents == 0) continue;
+
+                auto disconnect = [&](const char* reason) {
+                    std::cout << "Client disconnected: id=" << clients[i].id
+                              << " fd=" << clients[i].fd
+                              << " (" << reason << ")\n";
+                    ::close(clients[i].fd);
+                    clients.erase(clients.begin() + static_cast<std::ptrdiff_t>(i));
+                };
+
+                if ((revents & POLLNVAL) != 0) {
+                    disconnect("invalid fd");
+                    continue;
                 }
 
-                pending.append(buffer, static_cast<std::size_t>(received));
-                if (pending.size() > 64 * 1024) {
-                    std::cerr << "Protocol buffer exceeded 64 KiB; disconnecting client.\n";
-                    pending.clear();
-                    break;
-                }
-
-                std::size_t newline = 0;
-                while ((newline = pending.find('\n')) != std::string::npos) {
-                    std::string line = pending.substr(0, newline);
-                    pending.erase(0, newline + 1);
-                    if (!line.empty() && line.back() == '\r') line.pop_back();
-                    if (line.empty()) continue;
-
-                    ++received_lines;
-                    std::string error;
-                    auto sample = autosense::parse_sample(line, &error);
-                    if (!sample.has_value()) {
-                        ++rejected_count;
-                        std::cerr << "[PROTOCOL REJECTED] " << error << " | line=" << line << '\n';
+                // Drain readable data before handling POLLHUP: the peer may
+                // close immediately after sending its final batch.
+                if ((revents & POLLIN) != 0) {
+                    Client& client = clients[i];
+                    char buffer[2048];
+                    const ssize_t received = ::recv(client.fd, buffer, sizeof(buffer), 0);
+                    if (received == 0) {
+                        disconnect("peer closed");
                         continue;
                     }
-                    ++parsed_count;
-                    const auto push_result = queue.try_push(
-                        QueuedSample{*sample, std::chrono::steady_clock::now()});
-                    if (push_result == autosense::PushResult::DroppedOldest) {
-                        ++dropped_count;
-                    } else if (push_result == autosense::PushResult::Closed) {
-                        std::cerr << "Processing queue is closed; dropping sample.\n";
+                    if (received < 0) {
+                        if (errno == EINTR) continue;
+                        disconnect(std::strerror(errno));
+                        continue;
+                    }
+
+                    client.pending.append(buffer, static_cast<std::size_t>(received));
+                    if (client.pending.size() > 64 * 1024) {
+                        disconnect("protocol buffer exceeded 64 KiB");
+                        continue;
+                    }
+
+                    std::size_t newline = 0;
+                    while ((newline = client.pending.find('\n')) != std::string::npos) {
+                        std::string line = client.pending.substr(0, newline);
+                        client.pending.erase(0, newline + 1);
+                        if (!line.empty() && line.back() == '\r') line.pop_back();
+                        if (line.empty()) continue;
+
+                        ++received_lines;
+                        std::string error;
+                        auto sample = autosense::parse_sample(line, &error);
+                        if (!sample.has_value()) {
+                            ++rejected_count;
+                            std::cerr << "[PROTOCOL REJECTED] " << error
+                                      << " | line=" << line << '\n';
+                            continue;
+                        }
+                        ++parsed_count;
+                        const auto push_result = queue.try_push(
+                            QueuedSample{*sample, std::chrono::steady_clock::now(), client.id});
+                        if (push_result == autosense::PushResult::DroppedOldest) {
+                            ++dropped_count;
+                        } else if (push_result == autosense::PushResult::Closed) {
+                            std::cerr << "Processing queue is closed; dropping sample.\n";
+                        }
                     }
                 }
+
+                if ((revents & (POLLERR | POLLHUP)) != 0) {
+                    disconnect("hangup");
+                    continue;
+                }
             }
-            ::close(client_fd);
         }
 
+        for (auto& client : clients) {
+            ::close(client.fd);
+        }
+        clients.clear();
+        ::close(server_fd);
         queue.close();
         if (processor.joinable()) processor.join();
-        ::close(server_fd);
+
         std::sort(queue_wait_us.begin(), queue_wait_us.end());
         std::cout << "Server stopped."
                   << " lines=" << received_lines
